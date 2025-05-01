@@ -360,14 +360,36 @@ async function connectToWhatsApp() {
       }
       
       if (connection === 'close') {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        console.log('Connection closed due to ', lastDisconnect?.error, ', reconnect: ', shouldReconnect);
+        // Get detailed error information
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
         
-        if (shouldReconnect) {
-          connectToWhatsApp();
+        console.log('Connection closed due to:', errorMessage);
+        console.log('Status code:', statusCode);
+        console.log('Full error:', JSON.stringify(lastDisconnect?.error, null, 2));
+        
+        let shouldReconnect = true;
+        
+        // Handle specific error cases
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log('User is logged out, will not reconnect');
+          shouldReconnect = false;
+        } else if (statusCode === 428) {
+          console.log('Precondition required error, forcing reset of auth state');
+          // Force regenerate QR code next time
+          shouldReconnect = true;
+        }
+        
+        console.log('Will reconnect:', shouldReconnect);
+        
+        if (shouldReconnect && !isShuttingDown) {
+          console.log('Reconnecting in 5 seconds...');
+          setTimeout(connectToWhatsApp, 5000);
         }
       } else if (connection === 'open') {
         console.log('WhatsApp connection opened successfully!');
+        // Reset reconnect attempts
+        reconnectAttempts = 0;
       }
     });
 
