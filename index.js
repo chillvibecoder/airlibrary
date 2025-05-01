@@ -310,9 +310,18 @@ async function saveImageToDrive(imageUrl, title, isbn, drive, client = null, mes
 let authState = {
     creds: {
         me: null,
-        noiseKey: null,
-        signedIdentityKey: null,
-        signedPreKey: null,
+        noiseKey: {
+            public: Buffer.from([]),
+            private: Buffer.from([])
+        },
+        signedIdentityKey: {
+            public: Buffer.from([]),
+            private: Buffer.from([])
+        },
+        signedPreKey: {
+            public: Buffer.from([]),
+            private: Buffer.from([])
+        },
         registrationId: null,
         advSecretKey: null,
         nextPreKeyId: 1,
@@ -328,6 +337,19 @@ if (process.env.WHATSAPP_AUTH_STATE) {
     try {
         const parsedState = JSON.parse(process.env.WHATSAPP_AUTH_STATE);
         if (parsedState.creds && parsedState.keys) {
+            // Convert base64 strings back to Buffers
+            if (parsedState.creds.noiseKey) {
+                parsedState.creds.noiseKey.public = Buffer.from(parsedState.creds.noiseKey.public, 'base64');
+                parsedState.creds.noiseKey.private = Buffer.from(parsedState.creds.noiseKey.private, 'base64');
+            }
+            if (parsedState.creds.signedIdentityKey) {
+                parsedState.creds.signedIdentityKey.public = Buffer.from(parsedState.creds.signedIdentityKey.public, 'base64');
+                parsedState.creds.signedIdentityKey.private = Buffer.from(parsedState.creds.signedIdentityKey.private, 'base64');
+            }
+            if (parsedState.creds.signedPreKey) {
+                parsedState.creds.signedPreKey.public = Buffer.from(parsedState.creds.signedPreKey.public, 'base64');
+                parsedState.creds.signedPreKey.private = Buffer.from(parsedState.creds.signedPreKey.private, 'base64');
+            }
             authState = parsedState;
         }
     } catch (error) {
@@ -371,7 +393,21 @@ async function connectToWhatsApp() {
             state: authState,
             saveCreds: async () => {
                 const newState = {
-                    creds: authState.creds,
+                    creds: {
+                        ...authState.creds,
+                        noiseKey: {
+                            public: authState.creds.noiseKey.public.toString('base64'),
+                            private: authState.creds.noiseKey.private.toString('base64')
+                        },
+                        signedIdentityKey: {
+                            public: authState.creds.signedIdentityKey.public.toString('base64'),
+                            private: authState.creds.signedIdentityKey.private.toString('base64')
+                        },
+                        signedPreKey: {
+                            public: authState.creds.signedPreKey.public.toString('base64'),
+                            private: authState.creds.signedPreKey.private.toString('base64')
+                        }
+                    },
                     keys: authState.keys
                 };
                 console.log('New auth state:', JSON.stringify(newState));
@@ -392,13 +428,8 @@ async function connectToWhatsApp() {
         const client = sock;
         console.log('WhatsApp socket created');
 
-        client.ev.on('creds.update', saveCreds);
-
-        const visionClient = new vision.ImageAnnotatorClient({ credentials: require('./service-account.json') });
-        console.log('Vision client initialized successfully');
-
-        const serviceAccount = require('./service-account.json');
-        console.log('Service account loaded:', serviceAccount.client_email);
+        // Initialize Vision client with credentials
+        const visionClient = new vision.ImageAnnotatorClient({ credentials });
 
         const sheets = google.sheets({ version: 'v4', auth });
         console.log('Google Sheets client initialized successfully');
