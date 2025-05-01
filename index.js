@@ -2171,21 +2171,4 @@ if (process.env.GOOGLE_SERVICE_ACCOUNT) {
   }
 }
 
-// Handle WhatsApp Auth State
-const authStatePath = './auth_info/';
-if (!fs.existsSync(authStatePath)) {
-  fs.mkdirSync(authStatePath, { recursive: true });
-}
-
-// If auth state exists in environment variable, write it to file
-if (process.env.WHATSAPP_AUTH_STATE) {
-  try {
-    const authState = JSON.parse(process.env.WHATSAPP_AUTH_STATE);
-    fs.writeFileSync(path.join(authStatePath, 'creds.json'), JSON.stringify(authState));
-  } catch (error) {
-    console.error('Error handling WhatsApp auth state:', error);
-    process.exit(1);
-  }
-}
-
 connectToWhatsApp();
