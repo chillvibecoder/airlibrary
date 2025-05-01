@@ -1,15 +1,30 @@
 {
-  "name": "nodejs",
+  "name": "airlibrary",
   "version": "1.0.0",
-  "description": "",
+  "description": "WhatsApp bot for managing book library",
   "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@google-cloud/vision": "^4.2.1",
+    "@google/generative-ai": "^0.24.0",
+    "@whiskeysockets/baileys": "^6.17.16",
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.7",
+    "googleapis": "^134.0.0",
+    "link-preview-js": "^3.0.14",
+    "open": "^10.1.0",
+    "pino": "^8.19.0",
+    "pino-pretty": "^10.3.1",
+    "qrcode-terminal": "^0.12.0",
+    "server-destroy": "^1.0.1",
+    "sharp": "^0.32.6"
+  },
   "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "@types/node": "^18.0.6"
-  }
+  "license": "ISC"
 }

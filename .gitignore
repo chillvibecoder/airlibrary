@@ -1,3 +1,57 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Sensitive files
+service-account.json
+credentials.json
+auth_info/
+auth_info.checkpoint_*/
+
+# Logs
+*.log
+logs.txt
+debug_logs.txt
+bot.log
+sync_log.json
+
+# Temporary files
+temp/
+*.jpg
+*.png
+*.jpeg
+.DS_Store
+
+# Checkpoints and backups
+*.checkpoint*
+*.backup*
+index.js.*
+user_sheet_manager.js.*
+checkpoint_*/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build files
+dist/
+build/
+frontend/build/
+frontend/dist/
+
+# Test files
+*.test.js
+test_*.js
+
 # Logs
 logs
 *.log
@@ -39,7 +93,6 @@ bower_components
 build/Release
 
 # Dependency directories
-node_modules/
 jspm_packages/
 
 # Snowpack dependency directory (https://snowpack.dev/)
@@ -71,13 +124,6 @@ web_modules/
 
 # Yarn Integrity file
 .yarn-integrity
-
-# dotenv environment variable files
-.env
-.env.development.local
-.env.test.local
-.env.production.local
-.env.local
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache

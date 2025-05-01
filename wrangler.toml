@@ -1,0 +1,20 @@
+name = "airlibrary"
+main = "worker.js"
+compatibility_date = "2024-03-25"
+
+[build]
+command = "npm install"
+
+[env.production]
+vars = { }
+
+[env.production.build]
+command = "npm install --production"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "your-kv-namespace-id"
+preview_id = "your-preview-kv-namespace-id"
+
+[site]
+bucket = "./public" 
