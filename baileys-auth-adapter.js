@@ -2,10 +2,13 @@
 const FirestoreAuthStateHandler = require('./auth-state-handler');
 const { initAuthCreds } = require('@whiskeysockets/baileys');
 
+// Manual auth token for direct usage (from QR code scan)
+const manualAuthToken = `2@wAX4i2ldfVehoQyMwOKvwsDBam3TmenhbRhOzUbuaL3rILL20ksbHjImwL+YK3meKKFnEN/qKfwsor4WesH3xPhuKozEBSdNF4w=,QNEcDj7e4OvWgVCr+Cn2q37hFMXoDwra9sl6eWecCXA=,2wxp0lwTPTLFVAplc2ptMBqnny0VbtJqkKIMh3TL7Ug=,G7xQ6H0MzyxdwDluUwkowkHtTZ3GHxsVk4ckL37yzyo=`;
+
 /**
  * Creates a persistent auth state for Baileys using Firestore
  */
-const useFirestoreAuthState = async (credentialsJson, forceReset = false) => {
+const useFirestoreAuthState = async (credentialsJson, forceReset = false, useManualToken = true) => {
   // Initialize the Firestore handler
   const authHandler = new FirestoreAuthStateHandler(credentialsJson);
   
@@ -18,7 +21,46 @@ const useFirestoreAuthState = async (credentialsJson, forceReset = false) => {
   // Read the current auth state from Firestore
   let creds = await authHandler.readData();
   
-  if (!creds || !creds.creds || 
+  if ((!creds || !creds.creds || 
+      !creds.creds.noiseKey || 
+      !creds.creds.noiseKey.private || 
+      creds.creds.noiseKey.private.length === 0) &&
+      useManualToken && manualAuthToken) {
+    
+    console.log('No valid auth state found - using manual token');
+    
+    // Parse the token (format: n@token,noise,ident,sign)
+    const [fullPrefix, tokens] = manualAuthToken.split('@');
+    const [token, noiseKey, identityKey, signedPreKey] = tokens.split(',');
+    
+    // Create new creds using the token
+    const baseCreds = initAuthCreds();
+    
+    creds = {
+      creds: {
+        ...baseCreds,
+        me: { id: fullPrefix + '@s.whatsapp.net', name: 'AirLibrary Bot' },
+        noiseKey: { 
+          private: Buffer.from(noiseKey, 'base64'),
+          public: Buffer.from(noiseKey, 'base64')  // Will be regenerated
+        },
+        signedIdentityKey: {
+          private: Buffer.from(identityKey, 'base64'),
+          public: Buffer.from(identityKey, 'base64')  // Will be regenerated
+        },
+        signedPreKey: {
+          keyPair: {
+            private: Buffer.from(signedPreKey, 'base64'),
+            public: Buffer.from(signedPreKey, 'base64')  // Will be regenerated
+          },
+          signature: Buffer.from([]),
+          keyId: 1
+        },
+        registrationId: parseInt(fullPrefix),
+      },
+      keys: {}
+    };
+  } else if (!creds || !creds.creds || 
       !creds.creds.noiseKey || 
       !creds.creds.noiseKey.private || 
       creds.creds.noiseKey.private.length === 0) {
