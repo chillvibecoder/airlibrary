@@ -319,7 +319,7 @@ async function connectToWhatsApp() {
     }
 
     // Force a new auth session on first run to generate QR code
-    const forceReset = true; // Set to true to force new QR code generation
+    const forceReset = false; // Set to false to use existing auth state
     
     // Use Firestore for auth state instead of the file-based auth
     const { state, saveCreds } = await useFirestoreAuthState(process.env.GOOGLE_SERVICE_ACCOUNT, forceReset);
