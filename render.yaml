@@ -20,6 +20,6 @@ services:
       - key: NODE_OPTIONS
         value: "--openssl-legacy-provider"
       - key: DEPLOYMENT_TIMESTAMP
-        value: "20250501-1452"
+        value: "20250501-1458"
     healthCheckPath: /health
     autoDeploy: true 

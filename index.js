@@ -3,6 +3,7 @@ require('./compatibility');
 
 require('dotenv').config();
 const { makeWASocket, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode-terminal');
 const vision = require('@google-cloud/vision');
 const { google } = require('googleapis');
 const axios = require('axios');
@@ -317,8 +318,11 @@ async function connectToWhatsApp() {
       throw new Error('GOOGLE_SERVICE_ACCOUNT environment variable is required');
     }
 
+    // Force a new auth session on first run to generate QR code
+    const forceReset = true; // Set to true to force new QR code generation
+    
     // Use Firestore for auth state instead of the file-based auth
-    const { state, saveCreds } = await useFirestoreAuthState(process.env.GOOGLE_SERVICE_ACCOUNT);
+    const { state, saveCreds } = await useFirestoreAuthState(process.env.GOOGLE_SERVICE_ACCOUNT, forceReset);
     
     // Log auth state key lengths for debugging
     console.log('Auth state loaded with key lengths:', {
@@ -331,6 +335,29 @@ async function connectToWhatsApp() {
       printQRInTerminal: true,
       auth: state,
       browser: ['AirLibrary Bot', 'Chrome', '1.0.0']
+    });
+
+    // Enhanced QR code handling
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      
+      if (qr) {
+        // Print QR in a more visible format
+        console.log('\n\n========== SCAN THIS QR CODE TO AUTHENTICATE ==========\n');
+        qrcode.generate(qr, { small: true });
+        console.log('\n========== SCAN WITH WHATSAPP ON YOUR PHONE ==========\n\n');
+      }
+      
+      if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        console.log('Connection closed due to ', lastDisconnect?.error, ', reconnect: ', shouldReconnect);
+        
+        if (shouldReconnect) {
+          connectToWhatsApp();
+        }
+      } else if (connection === 'open') {
+        console.log('WhatsApp connection opened successfully!');
+      }
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -347,73 +374,6 @@ async function connectToWhatsApp() {
     console.log('Google Drive client initialized successfully');
 
     const imageQueue = new Map();
-
-    client.ev.on('connection.update', (update) => {
-        if (isShuttingDown) return;
-        
-        const { connection, lastDisconnect, qr } = update;
-        console.log('Connection update:', { connection, lastDisconnect, qr: qr ? 'QR received' : 'No QR' });
-        
-        if (qr) {
-            console.log('\n\n=== QR CODE RECEIVED ===\n');
-            require('qrcode-terminal').generate(qr, { small: true });
-            console.log('\n=== SCAN THIS QR CODE WITH WHATSAPP ===\n');
-        }
-        
-        if (connection === 'open') {
-            console.log('WhatsApp connected successfully!');
-            reconnectAttempts = 0;
-            if (!readyMessageSent) {
-                const sendReadyMessage = async () => {
-                    await new Promise(resolve => setTimeout(resolve, 15000));
-                    await sendMessageWithRetry(client, authenticatedNumber, { text: 'Bot ready. Send book images or "approve <number>" to add senders.' });
-                    readyMessageSent = true;
-                };
-                setTimeout(sendReadyMessage, 10000);
-            }
-        }
-        
-        if (connection === 'close') {
-            const error = lastDisconnect?.error;
-            const statusCode = error?.output?.statusCode;
-            console.log('Connection closed:', error);
-            
-            if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                console.log('Maximum reconnection attempts reached. Please restart the bot manually.');
-                return;
-            }
-            
-            if (statusCode === 401) {
-                console.log('401 detected, forcing re-authentication...');
-                require('fs').rmSync(authDir, { recursive: true, force: true });
-                if (!isShuttingDown) {
-                    reconnectAttempts++;
-                    setTimeout(connectToWhatsApp, 15000);
-                }
-            } else if (statusCode === 440) {
-                console.log('Stream conflict detected, reconnecting...');
-                if (!isShuttingDown) {
-                    reconnectAttempts++;
-                    setTimeout(connectToWhatsApp, 15000);
-                }
-            } else if (statusCode !== DisconnectReason.loggedOut && !isShuttingDown) {
-                reconnectAttempts++;
-                setTimeout(connectToWhatsApp, 15000);
-            }
-        }
-    });
-
-    process.on('SIGINT', async () => {
-        console.log('Shutting down...');
-        isShuttingDown = true;
-        try {
-            await client.logout();
-            console.log('Logged out successfully');
-        } catch (error) {
-            console.error('Error during logout:', error);
-        }
-        process.exit(0);
-    });
 
     client.ev.on('messages.upsert', async (messageUpdate) => {
         const messages = messageUpdate.messages;
