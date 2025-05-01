@@ -2,6 +2,7 @@ services:
   - type: web
     name: airlibrary-bot
     env: node
+    nodeVersion: 18
     buildCommand: npm install
     startCommand: node index.js
     envVars:
@@ -16,4 +17,6 @@ services:
       - key: DRIVE_FOLDER_ID
         sync: false
       - key: WHATSAPP_AUTH_STATE
-        sync: false 
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true 
