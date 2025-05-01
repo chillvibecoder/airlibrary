@@ -23,6 +23,9 @@ COPY . .
 # Create a file to fix crypto issue
 RUN echo "global.crypto = require('crypto');" > crypto-fix.js
 
+# Apply patch to Baileys library
+RUN node patch-baileys.js
+
 # Set environment variables to load the fix
 ENV NODE_OPTIONS="--require ./crypto-fix.js"
 
