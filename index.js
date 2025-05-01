@@ -306,55 +306,88 @@ async function saveImageToDrive(imageUrl, title, isbn, drive, client = null, mes
     }
 }
 
+// Initialize WhatsApp auth state
+let authState = {
+    creds: {
+        me: null,
+        noiseKey: null,
+        signedIdentityKey: null,
+        signedPreKey: null,
+        registrationId: null,
+        advSecretKey: null,
+        nextPreKeyId: 1,
+        firstUnuploadedPreKeyId: 1,
+        serverHasPreKeys: false,
+        myAppStateKeyId: null
+    },
+    keys: {}
+};
+
+// Check for existing auth state in environment variable
+if (process.env.WHATSAPP_AUTH_STATE) {
+    try {
+        const parsedState = JSON.parse(process.env.WHATSAPP_AUTH_STATE);
+        if (parsedState.creds && parsedState.keys) {
+            authState = parsedState;
+        }
+    } catch (error) {
+        console.error('Error parsing WhatsApp auth state:', error);
+    }
+}
+
+// Initialize Google Service Account
+if (!process.env.GOOGLE_SERVICE_ACCOUNT) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT environment variable is required');
+}
+
+let credentials;
+try {
+    const serviceAccountJson = Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT, 'base64').toString('utf-8');
+    credentials = JSON.parse(serviceAccountJson);
+} catch (error) {
+    throw new Error('Failed to parse GOOGLE_SERVICE_ACCOUNT: ' + error.message);
+}
+
+// Initialize Google Auth
+const auth = new google.auth.GoogleAuth({
+    credentials: credentials,
+    scopes: [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+});
+
+// Set up Google API options
+google.options({
+    auth: auth
+});
+
 async function connectToWhatsApp() {
     console.log('Script starting...');
     try {
-        // Handle WhatsApp Auth State
-        let authState = {};
-        if (process.env.WHATSAPP_AUTH_STATE) {
-            try {
-                authState = JSON.parse(process.env.WHATSAPP_AUTH_STATE);
-            } catch (error) {
-                console.error('Error handling WhatsApp auth state:', error);
-                process.exit(1);
-            }
-        }
-
-        // Create a custom auth state handler that works in memory
-        const state = {
-            creds: authState.creds || {},
-            keys: authState.keys || {}
-        };
-
-        const saveCreds = async () => {
-            // In production, you would want to store this in a database
-            // For now, we'll just log it
-            console.log('New auth state:', state);
-            return state;
-        };
-
         console.log('Auth state loaded');
+        
+        const { state, saveCreds } = {
+            state: authState,
+            saveCreds: async () => {
+                const newState = {
+                    creds: authState.creds,
+                    keys: authState.keys
+                };
+                console.log('New auth state:', JSON.stringify(newState));
+            }
+        };
 
         const sock = makeWASocket({
             printQRInTerminal: true,
             auth: state,
             browser: ['AirLibrary Bot', 'Chrome', '1.0.0'],
             getMessage: async (key) => {
-                if (store) {
-                    const msg = await store.loadMessage(key.remoteJid, key.id);
-                    return msg?.message || undefined;
-                }
-                return {
-                    conversation: 'Hello!'
-                };
+                return null;
             }
         });
 
-        // Handle auth updates
-        sock.ev.on('creds.update', async () => {
-            const newState = await saveCreds();
-            console.log('New auth state:', newState);
-        });
+        sock.ev.on('creds.update', saveCreds);
 
         const client = sock;
         console.log('WhatsApp socket created');
@@ -366,11 +399,6 @@ async function connectToWhatsApp() {
 
         const serviceAccount = require('./service-account.json');
         console.log('Service account loaded:', serviceAccount.client_email);
-
-        const auth = new google.auth.GoogleAuth({
-            credentials: serviceAccount,
-            scopes: ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
-        });
 
         const sheets = google.sheets({ version: 'v4', auth });
         console.log('Google Sheets client initialized successfully');
