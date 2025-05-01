@@ -343,9 +343,20 @@ async function connectToWhatsApp() {
       
       if (qr) {
         // Print QR in a more visible format
-        console.log('\n\n========== SCAN THIS QR CODE TO AUTHENTICATE ==========\n');
-        qrcode.generate(qr, { small: true });
-        console.log('\n========== SCAN WITH WHATSAPP ON YOUR PHONE ==========\n\n');
+        console.log('\n\n==============================================================================');
+        console.log('                      SCAN THIS QR CODE TO AUTHENTICATE                       ');
+        console.log('==============================================================================\n');
+        
+        // Force the QR code to be large and have more contrast
+        qrcode.generate(qr, { small: false });
+        
+        console.log('\n==============================================================================');
+        console.log('                     SCAN WITH WHATSAPP ON YOUR PHONE                         ');
+        console.log('==============================================================================\n\n');
+        
+        // Also log the raw QR data in case terminal rendering is poor
+        console.log('QR Code Data (if the QR code is unreadable):');
+        console.log(qr);
       }
       
       if (connection === 'close') {
