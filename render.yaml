@@ -18,5 +18,7 @@ services:
         sync: false
       - key: WHATSAPP_AUTH_STATE
         sync: false
+      - key: NODE_OPTIONS
+        value: "--require crypto"
     healthCheckPath: /health
     autoDeploy: true 
