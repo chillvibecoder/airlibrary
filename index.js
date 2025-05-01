@@ -1,3 +1,6 @@
+// Load crypto compatibility layer first
+require('./compatibility');
+
 require('dotenv').config();
 const { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const vision = require('@google-cloud/vision');
