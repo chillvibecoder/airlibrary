@@ -10,6 +10,7 @@ services:
         sync: false
       - key: GOOGLE_SERVICE_ACCOUNT
         sync: false
+        # This should be the base64-encoded JSON service account key with Firestore, Sheets, and Drive permissions
       - key: WHATSAPP_BOT_NUMBER
         sync: false
       - key: MASTER_SHEET_ID

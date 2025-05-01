@@ -2,7 +2,7 @@
 require('./compatibility');
 
 require('dotenv').config();
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
+const { makeWASocket, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const vision = require('@google-cloud/vision');
 const { google } = require('googleapis');
 const axios = require('axios');
@@ -12,6 +12,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const os = require('os');
 const sharp = require('sharp');
 const UserSheetManager = require('./user_sheet_manager');
+const { useFirestoreAuthState } = require('./baileys-auth-adapter');
 
 const authDir = 'auth_info';
 const sheetIdsFile = path.join(authDir, 'sheet_ids.json');
@@ -309,849 +310,754 @@ async function saveImageToDrive(imageUrl, title, isbn, drive, client = null, mes
     }
 }
 
-// Initialize WhatsApp auth state
-let authState = {
-    creds: {
-        me: null,
-        noiseKey: {
-            public: Buffer.from([]),
-            private: Buffer.from([])
-        },
-        signedIdentityKey: {
-            public: Buffer.from([]),
-            private: Buffer.from([])
-        },
-        signedPreKey: {
-            public: Buffer.from([]),
-            private: Buffer.from([])
-        },
-        registrationId: null,
-        advSecretKey: null,
-        nextPreKeyId: 1,
-        firstUnuploadedPreKeyId: 1,
-        serverHasPreKeys: false,
-        myAppStateKeyId: null
-    },
-    keys: {}
-};
-
-// Check for existing auth state in environment variable
-if (process.env.WHATSAPP_AUTH_STATE) {
-    try {
-        const parsedState = JSON.parse(process.env.WHATSAPP_AUTH_STATE);
-        if (parsedState.creds && parsedState.keys) {
-            // Convert base64 strings back to Buffers
-            if (parsedState.creds.noiseKey) {
-                parsedState.creds.noiseKey.public = Buffer.from(parsedState.creds.noiseKey.public, 'base64');
-                parsedState.creds.noiseKey.private = Buffer.from(parsedState.creds.noiseKey.private, 'base64');
-            }
-            if (parsedState.creds.signedIdentityKey) {
-                parsedState.creds.signedIdentityKey.public = Buffer.from(parsedState.creds.signedIdentityKey.public, 'base64');
-                parsedState.creds.signedIdentityKey.private = Buffer.from(parsedState.creds.signedIdentityKey.private, 'base64');
-            }
-            if (parsedState.creds.signedPreKey) {
-                parsedState.creds.signedPreKey.public = Buffer.from(parsedState.creds.signedPreKey.public, 'base64');
-                parsedState.creds.signedPreKey.private = Buffer.from(parsedState.creds.signedPreKey.private, 'base64');
-            }
-            authState = parsedState;
-        }
-    } catch (error) {
-        console.error('Error parsing WhatsApp auth state:', error);
-    }
-}
-
-// Initialize Google Service Account
-if (!process.env.GOOGLE_SERVICE_ACCOUNT) {
-    throw new Error('GOOGLE_SERVICE_ACCOUNT environment variable is required');
-}
-
-let credentials;
-try {
-    const serviceAccountJson = Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT, 'base64').toString('utf-8');
-    credentials = JSON.parse(serviceAccountJson);
-} catch (error) {
-    throw new Error('Failed to parse GOOGLE_SERVICE_ACCOUNT: ' + error.message);
-}
-
-// Initialize Google Auth
-const auth = new google.auth.GoogleAuth({
-    credentials: credentials,
-    scopes: [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/drive'
-    ]
-});
-
-// Set up Google API options
-google.options({
-    auth: auth
-});
-
 async function connectToWhatsApp() {
-    console.log('Script starting...');
-    try {
-        console.log('Auth state loaded');
+  console.log('Starting bot...');
+  try {
+    if (!process.env.GOOGLE_SERVICE_ACCOUNT) {
+      throw new Error('GOOGLE_SERVICE_ACCOUNT environment variable is required');
+    }
+
+    // Use Firestore for auth state instead of the file-based auth
+    const { state, saveCreds } = await useFirestoreAuthState(process.env.GOOGLE_SERVICE_ACCOUNT);
+    
+    // Log auth state key lengths for debugging
+    console.log('Auth state loaded with key lengths:', {
+      noiseKeyLength: state.creds?.noiseKey?.private?.length || 0,
+      signedIdentityKeyLength: state.creds?.signedIdentityKey?.private?.length || 0,
+      signedPreKeyLength: state.creds?.signedPreKey?.keyPair?.private?.length || 0
+    });
+
+    const sock = makeWASocket({
+      printQRInTerminal: true,
+      auth: state,
+      browser: ['AirLibrary Bot', 'Chrome', '1.0.0']
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+    const client = sock;
+    console.log('WhatsApp socket ready');
+
+    // Initialize Vision client with credentials
+    const visionClient = new vision.ImageAnnotatorClient({ credentials: state.creds });
+
+    const sheets = google.sheets({ version: 'v4', auth: state.creds });
+    console.log('Google Sheets client initialized successfully');
+
+    const drive = google.drive({ version: 'v3', auth: state.creds });
+    console.log('Google Drive client initialized successfully');
+
+    const imageQueue = new Map();
+
+    client.ev.on('connection.update', (update) => {
+        if (isShuttingDown) return;
         
-        const { state, saveCreds } = {
-            state: authState,
-            saveCreds: async () => {
-                const newState = {
-                    creds: {
-                        ...authState.creds,
-                        noiseKey: {
-                            public: authState.creds.noiseKey.public.toString('base64'),
-                            private: authState.creds.noiseKey.private.toString('base64')
-                        },
-                        signedIdentityKey: {
-                            public: authState.creds.signedIdentityKey.public.toString('base64'),
-                            private: authState.creds.signedIdentityKey.private.toString('base64')
-                        },
-                        signedPreKey: {
-                            public: authState.creds.signedPreKey.public.toString('base64'),
-                            private: authState.creds.signedPreKey.private.toString('base64')
-                        }
-                    },
-                    keys: authState.keys
+        const { connection, lastDisconnect, qr } = update;
+        console.log('Connection update:', { connection, lastDisconnect, qr: qr ? 'QR received' : 'No QR' });
+        
+        if (qr) {
+            console.log('\n\n=== QR CODE RECEIVED ===\n');
+            require('qrcode-terminal').generate(qr, { small: true });
+            console.log('\n=== SCAN THIS QR CODE WITH WHATSAPP ===\n');
+        }
+        
+        if (connection === 'open') {
+            console.log('WhatsApp connected successfully!');
+            reconnectAttempts = 0;
+            if (!readyMessageSent) {
+                const sendReadyMessage = async () => {
+                    await new Promise(resolve => setTimeout(resolve, 15000));
+                    await sendMessageWithRetry(client, authenticatedNumber, { text: 'Bot ready. Send book images or "approve <number>" to add senders.' });
+                    readyMessageSent = true;
                 };
-                console.log('New auth state:', JSON.stringify(newState));
+                setTimeout(sendReadyMessage, 10000);
             }
-        };
-
-        const sock = makeWASocket({
-            printQRInTerminal: true,
-            auth: state,
-            browser: ['AirLibrary Bot', 'Chrome', '1.0.0'],
-            getMessage: async (key) => {
-                return null;
-            }
-        });
-
-        sock.ev.on('creds.update', saveCreds);
-
-        const client = sock;
-        console.log('WhatsApp socket created');
-
-        // Initialize Vision client with credentials
-        const visionClient = new vision.ImageAnnotatorClient({ credentials });
-
-        const sheets = google.sheets({ version: 'v4', auth });
-        console.log('Google Sheets client initialized successfully');
-
-        const drive = google.drive({ version: 'v3', auth });
-        console.log('Google Drive client initialized successfully');
-
-        const imageQueue = new Map();
-
-        client.ev.on('connection.update', (update) => {
-            if (isShuttingDown) return;
+        }
+        
+        if (connection === 'close') {
+            const error = lastDisconnect?.error;
+            const statusCode = error?.output?.statusCode;
+            console.log('Connection closed:', error);
             
-            const { connection, lastDisconnect, qr } = update;
-            console.log('Connection update:', { connection, lastDisconnect, qr: qr ? 'QR received' : 'No QR' });
-            
-            if (qr) {
-                console.log('\n\n=== QR CODE RECEIVED ===\n');
-                require('qrcode-terminal').generate(qr, { small: true });
-                console.log('\n=== SCAN THIS QR CODE WITH WHATSAPP ===\n');
+            if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                console.log('Maximum reconnection attempts reached. Please restart the bot manually.');
+                return;
             }
             
-            if (connection === 'open') {
-                console.log('WhatsApp connected successfully!');
-                reconnectAttempts = 0;
-                if (!readyMessageSent) {
-                    const sendReadyMessage = async () => {
-                        await new Promise(resolve => setTimeout(resolve, 15000));
-                        await sendMessageWithRetry(client, authenticatedNumber, { text: 'Bot ready. Send book images or "approve <number>" to add senders.' });
-                        readyMessageSent = true;
-                    };
-                    setTimeout(sendReadyMessage, 10000);
-                }
-            }
-            
-            if (connection === 'close') {
-                const error = lastDisconnect?.error;
-                const statusCode = error?.output?.statusCode;
-                console.log('Connection closed:', error);
-                
-                if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                    console.log('Maximum reconnection attempts reached. Please restart the bot manually.');
-                    return;
-                }
-                
-                if (statusCode === 401) {
-                    console.log('401 detected, forcing re-authentication...');
-                    require('fs').rmSync(authDir, { recursive: true, force: true });
-                    if (!isShuttingDown) {
-                        reconnectAttempts++;
-                        setTimeout(connectToWhatsApp, 15000);
-                    }
-                } else if (statusCode === 440) {
-                    console.log('Stream conflict detected, reconnecting...');
-                    if (!isShuttingDown) {
-                        reconnectAttempts++;
-                        setTimeout(connectToWhatsApp, 15000);
-                    }
-                } else if (statusCode !== DisconnectReason.loggedOut && !isShuttingDown) {
+            if (statusCode === 401) {
+                console.log('401 detected, forcing re-authentication...');
+                require('fs').rmSync(authDir, { recursive: true, force: true });
+                if (!isShuttingDown) {
                     reconnectAttempts++;
                     setTimeout(connectToWhatsApp, 15000);
                 }
+            } else if (statusCode === 440) {
+                console.log('Stream conflict detected, reconnecting...');
+                if (!isShuttingDown) {
+                    reconnectAttempts++;
+                    setTimeout(connectToWhatsApp, 15000);
+                }
+            } else if (statusCode !== DisconnectReason.loggedOut && !isShuttingDown) {
+                reconnectAttempts++;
+                setTimeout(connectToWhatsApp, 15000);
             }
-        });
+        }
+    });
 
-        process.on('SIGINT', async () => {
-            console.log('Shutting down...');
-            isShuttingDown = true;
+    process.on('SIGINT', async () => {
+        console.log('Shutting down...');
+        isShuttingDown = true;
+        try {
+            await client.logout();
+            console.log('Logged out successfully');
+        } catch (error) {
+            console.error('Error during logout:', error);
+        }
+        process.exit(0);
+    });
+
+    client.ev.on('messages.upsert', async (messageUpdate) => {
+        const messages = messageUpdate.messages;
+        for (const msg of messages) {
             try {
-                await client.logout();
-                console.log('Logged out successfully');
-            } catch (error) {
-                console.error('Error during logout:', error);
-            }
-            process.exit(0);
-        });
+                const userId = msg.key.remoteJid;
+                const isGroupChat = userId.endsWith('@g.us');
+                const sender = isGroupChat ? msg.key.participant : userId;
+                const isFromMe = msg.key.fromMe;
 
-        client.ev.on('messages.upsert', async (messageUpdate) => {
-            const messages = messageUpdate.messages;
-            for (const msg of messages) {
-                try {
-                    const userId = msg.key.remoteJid;
-                    const isGroupChat = userId.endsWith('@g.us');
-                    const sender = isGroupChat ? msg.key.participant : userId;
-                    const isFromMe = msg.key.fromMe;
+                if (isGroupChat) {
+                    console.log(`Ignoring group message from ${userId}`);
+                    continue;
+                }
 
-                    if (isGroupChat) {
-                        console.log(`Ignoring group message from ${userId}`);
-                        continue;
-                    }
-
-                    if (isFromMe && userId === authenticatedNumber) {
-                        if (msg.message?.conversation) {
-                            const text = msg.message.conversation.toLowerCase();
-                            if (text.startsWith('approve ')) {
-                                const newSender = text.split('approve ')[1].trim() + '@s.whatsapp.net';
-                                approvedSenders.add(newSender);
-                                console.log(`Approved new sender: ${newSender}`);
-                                await client.sendMessage(authenticatedNumber, { text: `${newSender} approved.` });
-                                continue;
-                            } else if (text === 'show approved') {
-                                const sendersList = Array.from(approvedSenders).join('\n');
-                                console.log('Current approved senders:', sendersList);
-                                await client.sendMessage(authenticatedNumber, { text: `Current approved senders:\n${sendersList}` });
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Handle user messages - check both sender and userId
-                    if (!approvedSenders.has(sender) && !approvedSenders.has(userId)) {
-                        console.log(`Ignoring message from unauthorized sender: ${sender}`);
-                        continue;
-                    }
-
-                    let userBooks = userDatabases.get(sender) || [];
-                    let queue = imageQueue.get(sender) || [];
-
+                if (isFromMe && userId === authenticatedNumber) {
                     if (msg.message?.conversation) {
                         const text = msg.message.conversation.toLowerCase();
-                        console.log('Received message:', text);
-                        
-                        // Handle admin commands
-                        if (userId === authenticatedNumber) {
-                            if (text.startsWith('approve ')) {
-                                const newSender = text.split(' ')[1] + '@s.whatsapp.net';
-                                approvedSenders.add(newSender);
-                                console.log(`Approved new sender: ${newSender}`);
-                                await client.sendMessage(authenticatedNumber, { text: `${newSender} approved.` });
-                                continue;
-                            } else if (text === 'show approved') {
-                                const sendersList = Array.from(approvedSenders).join('\n');
-                                console.log('Current approved senders:', sendersList);
-                                await client.sendMessage(authenticatedNumber, { text: `Current approved senders:\n${sendersList}` });
-                                continue;
-                            }
+                        if (text.startsWith('approve ')) {
+                            const newSender = text.split('approve ')[1].trim() + '@s.whatsapp.net';
+                            approvedSenders.add(newSender);
+                            console.log(`Approved new sender: ${newSender}`);
+                            await client.sendMessage(authenticatedNumber, { text: `${newSender} approved.` });
+                            continue;
+                        } else if (text === 'show approved') {
+                            const sendersList = Array.from(approvedSenders).join('\n');
+                            console.log('Current approved senders:', sendersList);
+                            await client.sendMessage(authenticatedNumber, { text: `Current approved senders:\n${sendersList}` });
+                            continue;
                         }
-                        
-                        // Handle user messages
-                        if (text === 'finish') {
-                            console.log(`Finish command received from ${sender}, queue length: ${queue.length}`);
-                            if (queue.length > 0) {
-                                userBooks = await processBatch(sender, queue, userBooks, client, sheets, drive);
-                                imageQueue.set(sender, []);
-                            }
-                                    
-                            if (userBooks.length > 0) {
-                                try {
-                                    console.log(`Attempting to save ${userBooks.length} books to master sheet for ${sender}`);
-                                    const masterSheetLink = await appendToSheet(sender, userBooks, sheets, serviceAccount);
-                                    console.log(`Successfully saved to master sheet: ${masterSheetLink}`);
-                                    
-                                    // Check if user has individual sheet in UserSheets database
-                                    const userInfo = await getUserSheetInfo(sender, sheets);
-                                    
-                                    if (userInfo && userInfo.gmail) {
-                                        // Existing user - sync to their sheet
-                                        console.log(`Found existing sheet for ${sender}: ${userInfo.sheetId}`);
-                                        
-                                        // Format data for User Sheet
-                                        const formattedData = userBooks.map(book => [
-                                            book.isbn,                    // ISBN
-                                            book.title,                   // Title
-                                            book.metadata.subtitle || '', // Subtitle
-                                            book.author,                  // Author
-                                            book.metadata.publisher || '', // Publisher
-                                            book.metadata.publishedDate || '', // Published Date
-                                            book.metadata.description || '', // Description
-                                            book.metadata.pageCount || '', // Page
-                                            book.metadata.printType || '', // PrintType
-                                            (book.metadata.categories || []).join(', '), // Categories
-                                            book.metadata.imageLinks?.thumbnail || '', // Thumbnail
-                                            book.metadata.imageLinks?.smallThumbnail || '', // Thumbnail Small
-                                            book.metadata.language || '', // Language
-                                            sender,                       // Sender_Whatsapp
-                                            userInfo.gmail,               // Sender_Email
-                                            userInfo.name || '',          // Sender_Name
-                                            '1',                          // Sender_Frequency
-                                            '1',                          // Global_Frequency
-                                            book.metadata.industryIdentifiers?.find(id => id.type === 'ISBN_10')?.identifier || '', // ISBN_10
-                                            'WhatsApp',                   // Source
-                                            new Date().toISOString(),     // Timestamps
-                                            book.cover || ''              // Image URL
-                                        ]);
+                    }
+                }
 
-                                        // Directly append to the user's sheet
-                                        try {
-                                            await sheets.spreadsheets.values.append({
-                                                spreadsheetId: userInfo.sheetId,
-                                                range: 'A:V',
-                                                valueInputOption: 'RAW',
-                                                insertDataOption: 'INSERT_ROWS',
-                                                resource: {
-                                                    values: formattedData
-                                                }
-                                            });
-                                            
-                                            console.log(`Successfully synced ${formattedData.length} books to user sheet`);
-                                            
-                                            // Send success message with sheet URL
-                                            const sheetUrl = `https://docs.google.com/spreadsheets/d/${userInfo.sheetId}/edit`;
-                                            await sendMessageWithRetry(client, sender, {
-                                                text: `Books saved successfully!\n\nYour Sheet: ${sheetUrl}`
-                                            });
-                                        } catch (syncError) {
-                                            console.error('Error syncing to user sheet:', syncError);
-                                            
-                                            // If there's an error, try to create a new sheet
-                                            console.log(`Attempting to create new sheet for ${sender}`);
-                                            const sheetId = await createUserSheet(sender, userBooks, sheets);
-                                            
-                                            // Save to UserSheets database
-                                            await saveUserSheetInfo(sender, sheetId, userInfo.gmail, sheets);
-                                            
-                                            // Share with user
-                                            await shareSheetWithUser(sheetId, userInfo.gmail, drive);
-                                            
-                                            // Send URL
-                                            const sheetUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
-                                            await sendMessageWithRetry(client, sender, {
-                                                text: `Your book database has been recreated and shared: ${sheetUrl}`
-                                            });
-                                        }
-                                    } else {
-                                        // New user - ask for Gmail
-                                        waitingForGmail.set(sender, userBooks);
-                                        await sendMessageWithRetry(client, sender, { 
-                                            text: 'Please share your Gmail, your BOOKDB will be shared with your Gmail soon.' 
+                // Handle user messages - check both sender and userId
+                if (!approvedSenders.has(sender) && !approvedSenders.has(userId)) {
+                    console.log(`Ignoring message from unauthorized sender: ${sender}`);
+                    continue;
+                }
+
+                let userBooks = userDatabases.get(sender) || [];
+                let queue = imageQueue.get(sender) || [];
+
+                if (msg.message?.conversation) {
+                    const text = msg.message.conversation.toLowerCase();
+                    console.log('Received message:', text);
+                    
+                    // Handle admin commands
+                    if (userId === authenticatedNumber) {
+                        if (text.startsWith('approve ')) {
+                            const newSender = text.split(' ')[1] + '@s.whatsapp.net';
+                            approvedSenders.add(newSender);
+                            console.log(`Approved new sender: ${newSender}`);
+                            await client.sendMessage(authenticatedNumber, { text: `${newSender} approved.` });
+                            continue;
+                        } else if (text === 'show approved') {
+                            const sendersList = Array.from(approvedSenders).join('\n');
+                            console.log('Current approved senders:', sendersList);
+                            await client.sendMessage(authenticatedNumber, { text: `Current approved senders:\n${sendersList}` });
+                            continue;
+                        }
+                    }
+                    
+                    // Handle user messages
+                    if (text === 'finish') {
+                        console.log(`Finish command received from ${sender}, queue length: ${queue.length}`);
+                        if (queue.length > 0) {
+                            userBooks = await processBatch(sender, queue, userBooks, client, sheets, drive);
+                            imageQueue.set(sender, []);
+                        }
+                                    
+                        if (userBooks.length > 0) {
+                            try {
+                                console.log(`Attempting to save ${userBooks.length} books to master sheet for ${sender}`);
+                                const masterSheetLink = await appendToSheet(sender, userBooks, sheets, state.creds);
+                                console.log(`Successfully saved to master sheet: ${masterSheetLink}`);
+                                
+                                // Check if user has individual sheet in UserSheets database
+                                const userInfo = await getUserSheetInfo(sender, sheets);
+                                
+                                if (userInfo && userInfo.gmail) {
+                                    // Existing user - sync to their sheet
+                                    console.log(`Found existing sheet for ${sender}: ${userInfo.sheetId}`);
+                                    
+                                    // Format data for User Sheet
+                                    const formattedData = userBooks.map(book => [
+                                        book.isbn,                    // ISBN
+                                        book.title,                   // Title
+                                        book.metadata.subtitle || '', // Subtitle
+                                        book.author,                  // Author
+                                        book.metadata.publisher || '', // Publisher
+                                        book.metadata.publishedDate || '', // Published Date
+                                        book.metadata.description || '', // Description
+                                        book.metadata.pageCount || '', // Page
+                                        book.metadata.printType || '', // PrintType
+                                        (book.metadata.categories || []).join(', '), // Categories
+                                        book.metadata.imageLinks?.thumbnail || '', // Thumbnail
+                                        book.metadata.imageLinks?.smallThumbnail || '', // Thumbnail Small
+                                        book.metadata.language || '', // Language
+                                        sender,                       // Sender_Whatsapp
+                                        userInfo.gmail,               // Sender_Email
+                                        userInfo.name || '',          // Sender_Name
+                                        '1',                          // Sender_Frequency
+                                        '1',                          // Global_Frequency
+                                        book.metadata.industryIdentifiers?.find(id => id.type === 'ISBN_10')?.identifier || '', // ISBN_10
+                                        'WhatsApp',                   // Source
+                                        new Date().toISOString(),     // Timestamps
+                                        book.cover || ''              // Image URL
+                                    ]);
+
+                                    // Directly append to the user's sheet
+                                    try {
+                                        await sheets.spreadsheets.values.append({
+                                            spreadsheetId: userInfo.sheetId,
+                                            range: 'A:V',
+                                            valueInputOption: 'RAW',
+                                            insertDataOption: 'INSERT_ROWS',
+                                            resource: {
+                                                values: formattedData
+                                            }
+                                        });
+                                        
+                                        console.log(`Successfully synced ${formattedData.length} books to user sheet`);
+                                        
+                                        // Send success message with sheet URL
+                                        const sheetUrl = `https://docs.google.com/spreadsheets/d/${userInfo.sheetId}/edit`;
+                                        await sendMessageWithRetry(client, sender, {
+                                            text: `Books saved successfully!\n\nYour Sheet: ${sheetUrl}`
+                                        });
+                                    } catch (syncError) {
+                                        console.error('Error syncing to user sheet:', syncError);
+                                        
+                                        // If there's an error, try to create a new sheet
+                                        console.log(`Attempting to create new sheet for ${sender}`);
+                                        const sheetId = await createUserSheet(sender, userBooks, sheets);
+                                        
+                                        // Save to UserSheets database
+                                        await saveUserSheetInfo(sender, sheetId, userInfo.gmail, sheets);
+                                        
+                                        // Share with user
+                                        await shareSheetWithUser(sheetId, userInfo.gmail, drive);
+                                        
+                                        // Send URL
+                                        const sheetUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
+                                        await sendMessageWithRetry(client, sender, {
+                                            text: `Your book database has been recreated and shared: ${sheetUrl}`
                                         });
                                     }
-                                    
-                                    userDatabases.set(sender, []);
-                                    saveUserBooks();
-                                } catch (error) {
-                                    console.error('Error in finish flow:', error);
-                                    await sendMessageWithRetry(client, sender, { 
-                                        text: 'Error saving to sheets. Please try again or contact support.' 
-                                    });
-                                }
-                            } else {
-                                // No new books, check for existing sheet
-                                const userInfo = await getUserSheetInfo(sender, sheets);
-                                if (userInfo && userInfo.sheetId) {
-                                    const sheetUrl = `https://docs.google.com/spreadsheets/d/${userInfo.sheetId}/edit`;
-                                    await sendMessageWithRetry(client, sender, { 
-                                        text: `Your book database: ${sheetUrl}` 
-                                    });
                                 } else {
+                                    // New user - ask for Gmail
+                                    waitingForGmail.set(sender, userBooks);
                                     await sendMessageWithRetry(client, sender, { 
-                                        text: 'No books yet. Send ISBN image to start new entry.' 
+                                        text: 'Please share your Gmail, your BOOKDB will be shared with your Gmail soon.' 
                                     });
                                 }
-                            }
-                        } else if (waitingForGmail.has(sender)) {
-                            // Handle Gmail input
-                            const email = text.trim();
-                            if (email.includes('@gmail.com')) {
-                                const userBooks = waitingForGmail.get(sender);
-                                try {
-                                    // Create new sheet
-                                    const sheetId = await createUserSheet(sender, userBooks, sheets);
-                                    // Save to UserSheets database
-                                    await saveUserSheetInfo(sender, sheetId, email, sheets);
-                                    // Share with user
-                                    await shareSheetWithUser(sheetId, email, drive);
-                                    // Send URL
-                                    const sheetUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
-                                    await sendMessageWithRetry(client, sender, { 
-                                        text: `Your book database has been created and shared: ${sheetUrl}` 
-                                    });
-                                    // Clean up
-                                    waitingForGmail.delete(sender);
-                                } catch (error) {
-                                    console.error('Error creating/sharing sheet:', error);
-                                    await sendMessageWithRetry(client, sender, { 
-                                        text: 'Error creating your book database. Please try again.' 
-                                    });
-                                }
-                                continue;
-                            } else {
+                                
+                                userDatabases.set(sender, []);
+                                saveUserBooks();
+                            } catch (error) {
+                                console.error('Error in finish flow:', error);
                                 await sendMessageWithRetry(client, sender, { 
-                                    text: 'Please provide a valid Gmail address.' 
+                                    text: 'Error saving to sheets. Please try again or contact support.' 
                                 });
-                                continue;
                             }
-                        } else if (text === 'next') {
-                            console.log(`Next command received from ${sender} (redirecting to skip command)`);
-                            // For backward compatibility, redirect to skip logic
-                            if (queue.length === 1) {
-                                const isbnData = queue[0];
-                                
-                                // Add book with metadata and default cover
-                                const bookData = {
-                                    isbn: isbnData.metadata.isbn,
-                                    title: isbnData.metadata.title || 'Unknown',
-                                    author: isbnData.metadata.authors?.[0] || 'Unknown Author',
-                                    cover: isbnData.metadata.imageLinks?.thumbnail || 'Unknown',
-                                    condition: '',
-                                    metadata: isbnData.metadata
-                                };
-                                
-                                userBooks.push(bookData);
-                                userDatabases.set(sender, userBooks);
-                                saveUserBooks();
-                                
-                                // Clear the queue
-                                imageQueue.set(sender, []);
-                                
-                                // Detailed confirmation message with full book details
-                                const bookDetails = [
-                                    `Title: ${bookData.title}`,
-                                    `Author: ${bookData.author}`,
-                                    `ISBN: ${bookData.isbn}`,
-                                    bookData.metadata.publishedDate ? `Published: ${bookData.metadata.publishedDate}` : '',
-                                    bookData.metadata.publisher ? `Publisher: ${bookData.metadata.publisher}` : '',
-                                    bookData.metadata.categories?.length > 0 ? `Categories: ${bookData.metadata.categories.join(', ')}` : '',
-                                ].filter(line => line).join('\n');
-                                
-                                await sendMessageWithRetry(client, sender, { text: `Added book (no cover):\n${bookDetails}\n\nSend ISBN image to start new entry.` });
-                                
-                                // Try to save to sheet if possible
-                                try {
-                                    if (sheets) {
-                                        await appendToSheet(sender, bookData, sheets, serviceAccount);
-                                        console.log('Book added to sheet immediately after next command');
-                                    }
-                                } catch (error) {
-                                    console.error('Error saving to sheet after next command:', error);
-                                }
-                            } else {
-                                // Old behavior - clear queue
-                                imageQueue.set(sender, []);
-                                await sendMessageWithRetry(client, sender, { text: 'Queue cleared. Send ISBN image to start new entry.' });
-                            }
-                        } else if (text === 'skip') {
-                            console.log(`Skip command received from ${sender}, processing current ISBN without cover`);
-                            
-                            // If we have an ISBN in the queue but no cover yet
-                            if (queue.length === 1) {
-                                const isbnData = queue[0];
-                                
-                                // Add book with metadata and default cover
-                                const bookData = {
-                                    isbn: isbnData.metadata.isbn,
-                                    title: isbnData.metadata.title || 'Unknown',
-                                    author: isbnData.metadata.authors?.[0] || 'Unknown Author',
-                                    cover: isbnData.metadata.imageLinks?.thumbnail || 'Unknown',
-                                    condition: '',
-                                    metadata: isbnData.metadata
-                                };
-                                
-                                userBooks.push(bookData);
-                                userDatabases.set(sender, userBooks);
-                                saveUserBooks();
-                                
-                                // Clear the queue
-                                imageQueue.set(sender, []);
-                                
-                                // Detailed confirmation message with full book details
-                                const bookDetails = [
-                                    `Title: ${bookData.title}`,
-                                    `Author: ${bookData.author}`,
-                                    `ISBN: ${bookData.isbn}`,
-                                    bookData.metadata.publishedDate ? `Published: ${bookData.metadata.publishedDate}` : '',
-                                    bookData.metadata.publisher ? `Publisher: ${bookData.metadata.publisher}` : '',
-                                    bookData.metadata.categories?.length > 0 ? `Categories: ${bookData.metadata.categories.join(', ')}` : '',
-                                ].filter(line => line).join('\n');
-                                
-                                await sendMessageWithRetry(client, sender, { text: `Added book (no cover):\n${bookDetails}\n\nSend ISBN image to start new entry.` });
-                                
-                                // Try to save to sheet if possible
-                                try {
-                                    if (sheets) {
-                                        await appendToSheet(sender, bookData, sheets, serviceAccount);
-                                        console.log('Book added to sheet immediately after skip command');
-                                    }
-                                } catch (error) {
-                                    console.error('Error saving to sheet after skip command:', error);
-                                }
-                            } else {
-                                // Old behavior - clear queue
-                                imageQueue.set(sender, []);
-                                await sendMessageWithRetry(client, sender, { text: 'Queue cleared. Send ISBN image to start new entry.' });
-                            }
-                        } else if (text === 'clear this') {
-                            console.log(`Clear this command received from ${sender}`);
-                            
-                            // Clear only the current ISBN in the queue
-                            if (queue.length > 0) {
-                                imageQueue.set(sender, []);
-                                await sendMessageWithRetry(client, sender, { text: 'Current ISBN entry cleared. Send ISBN image to start new entry.' });
-                            } else {
-                                await sendMessageWithRetry(client, sender, { text: 'No current ISBN to clear. Send ISBN image to start new entry.' });
-                            }
-                        } else if (text === 'clear same') {
-                            console.log(`Clear same command received from ${sender}`);
-                            
-                            // Get current ISBN if it exists
-                            let currentIsbn = '';
-                            if (queue.length > 0 && queue[0].metadata && queue[0].metadata.isbn) {
-                                currentIsbn = queue[0].metadata.isbn;
-                            }
-                            
-                            if (currentIsbn) {
-                                // Remove all books with the same ISBN
-                                const initialCount = userBooks.length;
-                                userBooks = userBooks.filter(book => book.isbn !== currentIsbn);
-                                const removedCount = initialCount - userBooks.length;
-                                
-                                // Clear the current queue
-                                imageQueue.set(sender, []);
-                                
-                                // Update user database
-                                userDatabases.set(sender, userBooks);
-                                saveUserBooks();
-                                
+                        } else {
+                            // No new books, check for existing sheet
+                            const userInfo = await getUserSheetInfo(sender, sheets);
+                            if (userInfo && userInfo.sheetId) {
+                                const sheetUrl = `https://docs.google.com/spreadsheets/d/${userInfo.sheetId}/edit`;
                                 await sendMessageWithRetry(client, sender, { 
-                                    text: `Removed ${removedCount} entries with ISBN: ${currentIsbn}. Send ISBN image to start new entry.` 
+                                    text: `Your book database: ${sheetUrl}` 
                                 });
                             } else {
                                 await sendMessageWithRetry(client, sender, { 
-                                    text: 'No current ISBN to match. Send ISBN image to start new entry.' 
+                                    text: 'No books yet. Send ISBN image to start new entry.' 
                                 });
                             }
-                        } else if (text === 'clear all') {
-                            console.log(`Clear all command received from ${sender}`);
+                        }
+                    } else if (waitingForGmail.has(sender)) {
+                        // Handle Gmail input
+                        const email = text.trim();
+                        if (email.includes('@gmail.com')) {
+                            const userBooks = waitingForGmail.get(sender);
+                            try {
+                                // Create new sheet
+                                const sheetId = await createUserSheet(sender, userBooks, sheets);
+                                // Save to UserSheets database
+                                await saveUserSheetInfo(sender, sheetId, email, sheets);
+                                // Share with user
+                                await shareSheetWithUser(sheetId, email, drive);
+                                // Send URL
+                                const sheetUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
+                                await sendMessageWithRetry(client, sender, { 
+                                    text: `Your book database has been created and shared: ${sheetUrl}` 
+                                });
+                                // Clean up
+                                waitingForGmail.delete(sender);
+                            } catch (error) {
+                                console.error('Error creating/sharing sheet:', error);
+                                await sendMessageWithRetry(client, sender, { 
+                                    text: 'Error creating your book database. Please try again.' 
+                                });
+                            }
+                            continue;
+                        } else {
+                            await sendMessageWithRetry(client, sender, { 
+                                text: 'Please provide a valid Gmail address.' 
+                            });
+                            continue;
+                        }
+                    } else if (text === 'next') {
+                        console.log(`Next command received from ${sender} (redirecting to skip command)`);
+                        // For backward compatibility, redirect to skip logic
+                        if (queue.length === 1) {
+                            const isbnData = queue[0];
                             
-                            // Clear all entries without saving
-                            userBooks = [];
+                            // Add book with metadata and default cover
+                            const bookData = {
+                                isbn: isbnData.metadata.isbn,
+                                title: isbnData.metadata.title || 'Unknown',
+                                author: isbnData.metadata.authors?.[0] || 'Unknown Author',
+                                cover: isbnData.metadata.imageLinks?.thumbnail || 'Unknown',
+                                condition: '',
+                                metadata: isbnData.metadata
+                            };
+                            
+                            userBooks.push(bookData);
                             userDatabases.set(sender, userBooks);
+                            saveUserBooks();
+                            
+                            // Clear the queue
                             imageQueue.set(sender, []);
+                            
+                            // Detailed confirmation message with full book details
+                            const bookDetails = [
+                                `Title: ${bookData.title}`,
+                                `Author: ${bookData.author}`,
+                                `ISBN: ${bookData.isbn}`,
+                                bookData.metadata.publishedDate ? `Published: ${bookData.metadata.publishedDate}` : '',
+                                bookData.metadata.publisher ? `Publisher: ${bookData.metadata.publisher}` : '',
+                                bookData.metadata.categories?.length > 0 ? `Categories: ${bookData.metadata.categories.join(', ')}` : '',
+                            ].filter(line => line).join('\n');
+                            
+                            await sendMessageWithRetry(client, sender, { text: `Added book (no cover):\n${bookDetails}\n\nSend ISBN image to start new entry.` });
+                            
+                            // Try to save to sheet if possible
+                            try {
+                                if (sheets) {
+                                    await appendToSheet(sender, bookData, sheets, state.creds);
+                                    console.log('Book added to sheet immediately after next command');
+                                }
+                            } catch (error) {
+                                console.error('Error saving to sheet after next command:', error);
+                            }
+                        } else {
+                            // Old behavior - clear queue
+                            imageQueue.set(sender, []);
+                            await sendMessageWithRetry(client, sender, { text: 'Queue cleared. Send ISBN image to start new entry.' });
+                        }
+                    } else if (text === 'skip') {
+                        console.log(`Skip command received from ${sender}, processing current ISBN without cover`);
+                        
+                        // If we have an ISBN in the queue but no cover yet
+                        if (queue.length === 1) {
+                            const isbnData = queue[0];
+                            
+                            // Add book with metadata and default cover
+                            const bookData = {
+                                isbn: isbnData.metadata.isbn,
+                                title: isbnData.metadata.title || 'Unknown',
+                                author: isbnData.metadata.authors?.[0] || 'Unknown Author',
+                                cover: isbnData.metadata.imageLinks?.thumbnail || 'Unknown',
+                                condition: '',
+                                metadata: isbnData.metadata
+                            };
+                            
+                            userBooks.push(bookData);
+                            userDatabases.set(sender, userBooks);
+                            saveUserBooks();
+                            
+                            // Clear the queue
+                            imageQueue.set(sender, []);
+                            
+                            // Detailed confirmation message with full book details
+                            const bookDetails = [
+                                `Title: ${bookData.title}`,
+                                `Author: ${bookData.author}`,
+                                `ISBN: ${bookData.isbn}`,
+                                bookData.metadata.publishedDate ? `Published: ${bookData.metadata.publishedDate}` : '',
+                                bookData.metadata.publisher ? `Publisher: ${bookData.metadata.publisher}` : '',
+                                bookData.metadata.categories?.length > 0 ? `Categories: ${bookData.metadata.categories.join(', ')}` : '',
+                            ].filter(line => line).join('\n');
+                            
+                            await sendMessageWithRetry(client, sender, { text: `Added book (no cover):\n${bookDetails}\n\nSend ISBN image to start new entry.` });
+                            
+                            // Try to save to sheet if possible
+                            try {
+                                if (sheets) {
+                                    await appendToSheet(sender, bookData, sheets, state.creds);
+                                    console.log('Book added to sheet immediately after skip command');
+                                }
+                            } catch (error) {
+                                console.error('Error saving to sheet after skip command:', error);
+                            }
+                        } else {
+                            // Old behavior - clear queue
+                            imageQueue.set(sender, []);
+                            await sendMessageWithRetry(client, sender, { text: 'Queue cleared. Send ISBN image to start new entry.' });
+                        }
+                    } else if (text === 'clear this') {
+                        console.log(`Clear this command received from ${sender}`);
+                        
+                        // Clear only the current ISBN in the queue
+                        if (queue.length > 0) {
+                            imageQueue.set(sender, []);
+                            await sendMessageWithRetry(client, sender, { text: 'Current ISBN entry cleared. Send ISBN image to start new entry.' });
+                        } else {
+                            await sendMessageWithRetry(client, sender, { text: 'No current ISBN to clear. Send ISBN image to start new entry.' });
+                        }
+                    } else if (text === 'clear same') {
+                        console.log(`Clear same command received from ${sender}`);
+                        
+                        // Get current ISBN if it exists
+                        let currentIsbn = '';
+                        if (queue.length > 0 && queue[0].metadata && queue[0].metadata.isbn) {
+                            currentIsbn = queue[0].metadata.isbn;
+                        }
+                        
+                        if (currentIsbn) {
+                            // Remove all books with the same ISBN
+                            const initialCount = userBooks.length;
+                            userBooks = userBooks.filter(book => book.isbn !== currentIsbn);
+                            const removedCount = initialCount - userBooks.length;
+                            
+                            // Clear the current queue
+                            imageQueue.set(sender, []);
+                            
+                            // Update user database
+                            userDatabases.set(sender, userBooks);
                             saveUserBooks();
                             
                             await sendMessageWithRetry(client, sender, { 
-                                text: 'All entries cleared. No data was saved to Google Sheets. Send ISBN image to start new entry.' 
+                                text: `Removed ${removedCount} entries with ISBN: ${currentIsbn}. Send ISBN image to start new entry.` 
                             });
-                        } else if (text === 'help' || text === 'commands' || text === 'show commands') {
-                            console.log(`Help command requested by ${sender}`);
+                        } else {
+                            await sendMessageWithRetry(client, sender, { 
+                                text: 'No current ISBN to match. Send ISBN image to start new entry.' 
+                            });
+                        }
+                    } else if (text === 'clear all') {
+                        console.log(`Clear all command received from ${sender}`);
+                        
+                        // Clear all entries without saving
+                        userBooks = [];
+                        userDatabases.set(sender, userBooks);
+                        imageQueue.set(sender, []);
+                        saveUserBooks();
+                        
+                        await sendMessageWithRetry(client, sender, { 
+                            text: 'All entries cleared. No data was saved to Google Sheets. Send ISBN image to start new entry.' 
+                        });
+                    } else if (text === 'help' || text === 'commands' || text === 'show commands') {
+                        console.log(`Help command requested by ${sender}`);
+                        
+                        const helpMessage = [
+                            "ℹ️ *Help Commands:*",
+                            "",
+                            "📚 *Book Management:*",
+                            "• Send ISBN image to start new entry",
+                            "• Send cover image to complete entry",
+                            "• *finish* - Save all entries to sheet",
+                            "• *skip* - Skip cover image and save entry",
+                            "• *clear this* - Clear current ISBN entry",
+                            "• *clear same* - Remove all entries with same ISBN",
+                            "• *clear all* - Clear all unsaved entries",
+                            "",
+                            "📖 *Viewing Books:*",
+                            "• *view books* or *my books* - View your library",
+                            "• *view more* or *next page* - Show more books",
+                            "",
+                            "✏️ *Manual Entry:*",
+                            "• *no isbn* - Skip ISBN requirement",
+                            "• *title: <text>* - Set book title",
+                            "• *author: <text>* - Set book author",
+                            "• *isbn: <number>* - Enter ISBN manually",
+                            "",
+                            "ℹ️ *Other Commands:*",
+                            "• *show commands* - Show this list (alias)"
+                        ].join('\n');
+                        
+                        await sendMessageWithRetry(client, sender, { text: helpMessage });
+                    } else if (text === 'view books' || text === 'my books') {
+                        console.log(`View books command requested by ${sender}`);
+                        
+                        try {
+                            // Get the user's phone number without the WhatsApp suffix
+                            const userPhone = sender.replace('@s.whatsapp.net', '');
                             
-                            const helpMessage = [
-                                "ℹ️ *Help Commands:*",
-                                "",
-                                "📚 *Book Management:*",
-                                "• Send ISBN image to start new entry",
-                                "• Send cover image to complete entry",
-                                "• *finish* - Save all entries to sheet",
-                                "• *skip* - Skip cover image and save entry",
-                                "• *clear this* - Clear current ISBN entry",
-                                "• *clear same* - Remove all entries with same ISBN",
-                                "• *clear all* - Clear all unsaved entries",
-                                "",
-                                "📖 *Viewing Books:*",
-                                "• *view books* or *my books* - View your library",
-                                "• *view more* or *next page* - Show more books",
-                                "",
-                                "✏️ *Manual Entry:*",
-                                "• *no isbn* - Skip ISBN requirement",
-                                "• *title: <text>* - Set book title",
-                                "• *author: <text>* - Set book author",
-                                "• *isbn: <number>* - Enter ISBN manually",
-                                "",
-                                "ℹ️ *Other Commands:*",
-                                "• *show commands* - Show this list (alias)"
-                            ].join('\n');
+                            await sendMessageWithRetry(client, sender, { 
+                                text: `Fetching your books, please wait...` 
+                            });
                             
-                            await sendMessageWithRetry(client, sender, { text: helpMessage });
-                        } else if (text === 'view books' || text === 'my books') {
-                            console.log(`View books command requested by ${sender}`);
+                            // Get user's books from the Google Sheet
+                            const userBooksFromSheet = await getUserBooksFromSheet(userPhone, sheets, state.creds);
                             
-                            try {
-                                // Get the user's phone number without the WhatsApp suffix
-                                const userPhone = sender.replace('@s.whatsapp.net', '');
-                                
+                            if (!userBooksFromSheet || userBooksFromSheet.length === 0) {
                                 await sendMessageWithRetry(client, sender, { 
-                                    text: `Fetching your books, please wait...` 
+                                    text: 'You have not added any books to your library yet. Use the "isbn:" command to add books.' 
                                 });
-                                
-                                // Get user's books from the Google Sheet
-                                const userBooksFromSheet = await getUserBooksFromSheet(userPhone, sheets, serviceAccount);
-                                
-                                if (!userBooksFromSheet || userBooksFromSheet.length === 0) {
-                                    await sendMessageWithRetry(client, sender, { 
-                                        text: 'You have not added any books to your library yet. Use the "isbn:" command to add books.' 
-                                    });
-                                    return;
-                                }
-                                
-                                // Reset page to 1 for new view books request
-                                userViewState.set(sender, { 
-                                    page: 1,
-                                    totalBooks: userBooksFromSheet.length,
-                                    books: userBooksFromSheet
-                                });
-                                
-                                // Format the books list for page 1
-                                const booksMessage = formatBooksListMessage(userBooksFromSheet, 1);
-                                
-                                // Send the formatted list to the user
-                                await sendMessageWithRetry(client, sender, { text: booksMessage });
-                            } catch (error) {
-                                console.error('Error fetching user books:', error);
-                                await sendMessageWithRetry(client, sender, { 
-                                    text: 'Error retrieving your books. Please try again later.' 
-                                });
-                            }
-                        } else if (text === 'view more' || text === 'next page') {
-                            console.log(`View more books requested by ${sender}`);
-                            
-                            // Check if the user has an active view state
-                            const viewState = userViewState.get(sender);
-                            
-                            if (!viewState) {
-                                await sendMessageWithRetry(client, sender, { 
-                                    text: 'Please use "view books" first to start browsing your library.' 
-                                });
-                                continue;
+                                return;
                             }
                             
-                            // Increment the page number
-                            viewState.page += 1;
-                            userViewState.set(sender, viewState);
+                            // Reset page to 1 for new view books request
+                            userViewState.set(sender, { 
+                                page: 1,
+                                totalBooks: userBooksFromSheet.length,
+                                books: userBooksFromSheet
+                            });
                             
-                            // Format the books list for the next page
-                            const booksMessage = formatBooksListMessage(viewState.books, viewState.page);
+                            // Format the books list for page 1
+                            const booksMessage = formatBooksListMessage(userBooksFromSheet, 1);
                             
                             // Send the formatted list to the user
                             await sendMessageWithRetry(client, sender, { text: booksMessage });
-                        } else if (text === 'no isbn') {
-                            console.log(`No ISBN command received from ${sender}`);
-                            if (queue.length === 0) {
-                                queue.push({ 
-                                    type: 'isbn', 
-                                    data: null, 
-                                    url: null, 
-                                    metadata: { isbn: 'NO_ISBN_' + Date.now(), title: 'Unknown', authors: ['Unknown'], source: 'Manual Entry' }
-                                });
-                                imageQueue.set(sender, queue);
-                                await sendMessageWithRetry(client, sender, { text: 'ISBN requirement skipped. Send cover image to complete the entry.' });
-                            } else {
-                                await sendMessageWithRetry(client, sender, { text: 'Please send a cover image first.' });
-                            }
-                        } else if (text.startsWith('title:')) {
-                            const title = text.split('title:')[1].trim();
-                            console.log('Processing manual title input:', title);
-                            
-                            if (queue.length > 0) {
-                                const currentBook = queue[0];
-                                currentBook.metadata.title = title;
-                                queue[0] = currentBook;
-                                imageQueue.set(sender, queue);
-                                await sendMessageWithRetry(client, sender, { text: `Title updated to: ${title}\nSend cover image to complete the entry.` });
-                            } else if (userBooks.length > 0) {
-                                const lastBook = userBooks[userBooks.length - 1];
-                                lastBook.title = title;
-                                lastBook.metadata.title = title;
-                                userBooks[userBooks.length - 1] = lastBook;
-                                userDatabases.set(sender, userBooks);
-                                saveUserBooks();
-                                await sendMessageWithRetry(client, sender, { text: `Title updated to: ${title} for the last book.` });
-                            } else {
-                                await sendMessageWithRetry(client, sender, { text: 'No book to update. Please send ISBN image first.' });
-                            }
-                        } else if (text.startsWith('author:')) {
-                            const author = text.split('author:')[1].trim();
-                            console.log('Processing manual author input:', author);
-                            
-                            if (queue.length > 0) {
-                                const currentBook = queue[0];
-                                currentBook.metadata.authors = [author];
-                                queue[0] = currentBook;
-                                imageQueue.set(sender, queue);
-                                await sendMessageWithRetry(client, sender, { text: `Author updated to: ${author}\nSend cover image to complete the entry.` });
-                            } else if (userBooks.length > 0) {
-                                const lastBook = userBooks[userBooks.length - 1];
-                                lastBook.author = author;
-                                lastBook.metadata.authors = [author];
-                                userBooks[userBooks.length - 1] = lastBook;
-                                userDatabases.set(sender, userBooks);
-                                saveUserBooks();
-                                await sendMessageWithRetry(client, sender, { text: `Author updated to: ${author} for the last book.` });
-                            } else {
-                                await sendMessageWithRetry(client, sender, { text: 'No book to update. Please send ISBN image first.' });
-                            }
-                        } else if (text.startsWith('isbn:')) {
-                            const isbn = text.split('isbn:')[1].trim().replace(/[^0-9]/g, '');
-                            console.log('Processing ISBN input:', isbn);
-                            
-                            if (isbn.length === 10 || isbn.length === 13) {
-                                try {
-                                    const metadata = await fetchMetadata(isbn);
-                                    if (metadata.title && metadata.authors?.[0]) {
-                                        // Only add to queue, not to userBooks yet
-                                        queue.push({ type: 'isbn', data: null, url: null, metadata });
-                                        imageQueue.set(sender, queue);
-                                        await sendMessageWithRetry(client, sender, { 
-                                            text: `Found: ${metadata.title} by ${metadata.authors[0]}\nSend cover image next.` 
-                                        });
-                                    } else {
-                                        await sendMessageWithRetry(client, sender, { text: 'Could not find book details for this ISBN. Please try again.' });
-                                    }
-                                } catch (error) {
-                                    console.error('Error processing ISBN:', error);
-                                    await sendMessageWithRetry(client, sender, { text: 'Error processing ISBN. Please try again.' });
-                                }
-                            } else {
-                                await sendMessageWithRetry(client, sender, { text: 'Invalid ISBN format. Please enter a valid 10 or 13 digit ISBN.' });
-                            }
-                        }
-                        continue;
-                    }
-
-                    if (msg.message?.imageMessage) {
-                        console.log('Received image message');
-                        try {
-                            const media = await downloadMediaMessage(msg, 'buffer', {}, { logger: client.logger, reuploadRequest: client.updateMediaMessage });
-                            console.log('Successfully downloaded image');
-                            
-                            if (queue.length === 0) {
-                                console.log('Processing ISBN image first...');
-                                const isbnNumber = await extractISBN(media, visionClient);
-                                if (isbnNumber) {
-                                    console.log('Found ISBN:', isbnNumber);
-                                    // Send immediate confirmation that ISBN was found
-                                    await sendMessageWithRetry(client, sender, { text: `Found ISBN: ${isbnNumber}\nLooking up book details...` });
-                                    
-                                    const metadata = await fetchMetadata(isbnNumber);
-                                    if (metadata.title && metadata.authors?.[0]) {
-                                        metadata.isbn = isbnNumber;
-                                        queue.push({ type: 'isbn', data: media, url: msg.message.imageMessage.url, metadata });
-                                        imageQueue.set(sender, queue);
-                                        await sendMessageWithRetry(client, sender, { text: `Found: ${metadata.title} by ${metadata.authors[0]}\nSend cover image next.` });
-                                    } else {
-                                        await sendMessageWithRetry(client, sender, { text: 'Could not find book details. Please try again with a clearer ISBN image.' });
-                                    }
-                                } else {
-                                    console.log('Image is not an ISBN, ignoring...');
-                                    await sendMessageWithRetry(client, sender, { text: 'Could not find a valid ISBN in the image. Please try again with a clearer image of the ISBN.' });
-                                }
-                            } else if (queue.length === 1) {
-                                console.log('Processing cover image...');
-                                const isbnData = queue[0];
-                                
-                                try {
-                                    console.log(`Processing book: ${isbnData.metadata.title}, ISBN: ${isbnData.metadata.isbn}`);
-                                    console.log(`Original cover URL: ${msg.message.imageMessage.url}`);
-                                    
-                                    // Save image to Drive
-                                    const driveUrl = await saveImageToDrive(
-                                        msg.message.imageMessage.url,
-                                        isbnData.metadata.title || 'Unknown',
-                                        isbnData.metadata.isbn || 'NoISBN',
-                                        drive,
-                                        client,
-                                        msg
-                                    );
-                                    
-                                    // If we couldn't save to Drive, use WhatsApp URL but with a warning
-                                    const finalCoverUrl = driveUrl || msg.message.imageMessage.url;
-                                    const driveWarning = !driveUrl ? " (WARNING: Could not save to Google Drive, using WhatsApp URL instead)" : "";
-                                    
-                                    console.log(`Using cover URL: ${finalCoverUrl}${driveWarning}`);
-                                    
-                                    // Create metadata object with the URL
-                                    const baseMetadata = {
-                                        ...isbnData.metadata,
-                                        googleDriveUrl: driveUrl || msg.message.imageMessage.url
-                                    };
-                                    
-                                    // Fetch additional metadata
-                                    const metadata = await fetchMetadata(isbnData.metadata.isbn, baseMetadata);
-                                    console.log(`Using URL for metadata: ${metadata.googleDriveUrl}`);
-                                    
-                                    // Create the book data object
-                                    const bookData = {
-                                        isbn: isbnData.metadata.isbn,
-                                        title: metadata?.title || isbnData.metadata.title || 'Unknown',
-                                        author: metadata?.authors?.[0] || isbnData.metadata.author || 'Unknown Author',
-                                        cover: finalCoverUrl,
-                                        condition: '',
-                                        sheetId: isbnData.sheetId,
-                                        metadata: metadata
-                                    };
-                                    
-                                    // Add to user's books
-                                    userBooks.push(bookData);
-                                    userDatabases.set(sender, userBooks);
-                                    saveUserBooks();
-                                    
-                                    // Send confirmation message
-                                    await sendMessageWithRetry(client, sender, { 
-                                        text: `Added: ${bookData.title}${driveWarning}`
-                                    });
-                                    
-                                    // Clear the queue after processing
-                                    imageQueue.set(sender, []);
-                                } catch (error) {
-                                    console.error('Error processing cover image:', error);
-                                    await sendMessageWithRetry(client, sender, { 
-                                        text: `Error processing book: ${error.message}. Try again.`
-                                    });
-                                }
-                            }
                         } catch (error) {
-                            console.error('Error processing image:', error);
-                            if (queue.length === 0) {
-                                await sendMessageWithRetry(client, sender, { text: 'Error processing ISBN image. Please try again.' });
+                            console.error('Error fetching user books:', error);
+                            await sendMessageWithRetry(client, sender, { 
+                                text: 'Error retrieving your books. Please try again later.' 
+                            });
+                        }
+                    } else if (text === 'view more' || text === 'next page') {
+                        console.log(`View more books requested by ${sender}`);
+                        
+                        // Check if the user has an active view state
+                        const viewState = userViewState.get(sender);
+                        
+                        if (!viewState) {
+                            await sendMessageWithRetry(client, sender, { 
+                                text: 'Please use "view books" first to start browsing your library.' 
+                            });
+                            continue;
+                        }
+                        
+                        // Increment the page number
+                        viewState.page += 1;
+                        userViewState.set(sender, viewState);
+                        
+                        // Format the books list for the next page
+                        const booksMessage = formatBooksListMessage(viewState.books, viewState.page);
+                        
+                        // Send the formatted list to the user
+                        await sendMessageWithRetry(client, sender, { text: booksMessage });
+                    } else if (text === 'no isbn') {
+                        console.log(`No ISBN command received from ${sender}`);
+                        if (queue.length === 0) {
+                            queue.push({ 
+                                type: 'isbn', 
+                                data: null, 
+                                url: null, 
+                                metadata: { isbn: 'NO_ISBN_' + Date.now(), title: 'Unknown', authors: ['Unknown'], source: 'Manual Entry' }
+                            });
+                            imageQueue.set(sender, queue);
+                            await sendMessageWithRetry(client, sender, { text: 'ISBN requirement skipped. Send cover image to complete the entry.' });
+                        } else {
+                            await sendMessageWithRetry(client, sender, { text: 'Please send a cover image first.' });
+                        }
+                    } else if (text.startsWith('title:')) {
+                        const title = text.split('title:')[1].trim();
+                        console.log('Processing manual title input:', title);
+                        
+                        if (queue.length > 0) {
+                            const currentBook = queue[0];
+                            currentBook.metadata.title = title;
+                            queue[0] = currentBook;
+                            imageQueue.set(sender, queue);
+                            await sendMessageWithRetry(client, sender, { text: `Title updated to: ${title}\nSend cover image to complete the entry.` });
+                        } else if (userBooks.length > 0) {
+                            const lastBook = userBooks[userBooks.length - 1];
+                            lastBook.title = title;
+                            lastBook.metadata.title = title;
+                            userBooks[userBooks.length - 1] = lastBook;
+                            userDatabases.set(sender, userBooks);
+                            saveUserBooks();
+                            await sendMessageWithRetry(client, sender, { text: `Title updated to: ${title} for the last book.` });
+                        } else {
+                            await sendMessageWithRetry(client, sender, { text: 'No book to update. Please send ISBN image first.' });
+                        }
+                    } else if (text.startsWith('author:')) {
+                        const author = text.split('author:')[1].trim();
+                        console.log('Processing manual author input:', author);
+                        
+                        if (queue.length > 0) {
+                            const currentBook = queue[0];
+                            currentBook.metadata.authors = [author];
+                            queue[0] = currentBook;
+                            imageQueue.set(sender, queue);
+                            await sendMessageWithRetry(client, sender, { text: `Author updated to: ${author}\nSend cover image to complete the entry.` });
+                        } else if (userBooks.length > 0) {
+                            const lastBook = userBooks[userBooks.length - 1];
+                            lastBook.author = author;
+                            lastBook.metadata.authors = [author];
+                            userBooks[userBooks.length - 1] = lastBook;
+                            userDatabases.set(sender, userBooks);
+                            saveUserBooks();
+                            await sendMessageWithRetry(client, sender, { text: `Author updated to: ${author} for the last book.` });
+                        } else {
+                            await sendMessageWithRetry(client, sender, { text: 'No book to update. Please send ISBN image first.' });
+                        }
+                    } else if (text.startsWith('isbn:')) {
+                        const isbn = text.split('isbn:')[1].trim().replace(/[^0-9]/g, '');
+                        console.log('Processing ISBN input:', isbn);
+                        
+                        if (isbn.length === 10 || isbn.length === 13) {
+                            try {
+                                const metadata = await fetchMetadata(isbn);
+                                if (metadata.title && metadata.authors?.[0]) {
+                                    // Only add to queue, not to userBooks yet
+                                    queue.push({ type: 'isbn', data: null, url: null, metadata });
+                                    imageQueue.set(sender, queue);
+                                    await sendMessageWithRetry(client, sender, { 
+                                        text: `Found: ${metadata.title} by ${metadata.authors[0]}\nSend cover image next.` 
+                                    });
+                                } else {
+                                    await sendMessageWithRetry(client, sender, { text: 'Could not find book details for this ISBN. Please try again.' });
+                                }
+                            } catch (error) {
+                                console.error('Error processing ISBN:', error);
+                                await sendMessageWithRetry(client, sender, { text: 'Error processing ISBN. Please try again.' });
+                            }
+                        } else {
+                            await sendMessageWithRetry(client, sender, { text: 'Invalid ISBN format. Please enter a valid 10 or 13 digit ISBN.' });
+                        }
+                    }
+                    continue;
+                }
+
+                if (msg.message?.imageMessage) {
+                    console.log('Received image message');
+                    try {
+                        const media = await downloadMediaMessage(msg, 'buffer', {}, { logger: client.logger, reuploadRequest: client.updateMediaMessage });
+                        console.log('Successfully downloaded image');
+                        
+                        if (queue.length === 0) {
+                            console.log('Processing ISBN image first...');
+                            const isbnNumber = await extractISBN(media, visionClient);
+                            if (isbnNumber) {
+                                console.log('Found ISBN:', isbnNumber);
+                                // Send immediate confirmation that ISBN was found
+                                await sendMessageWithRetry(client, sender, { text: `Found ISBN: ${isbnNumber}\nLooking up book details...` });
+                                
+                                const metadata = await fetchMetadata(isbnNumber);
+                                if (metadata.title && metadata.authors?.[0]) {
+                                    metadata.isbn = isbnNumber;
+                                    queue.push({ type: 'isbn', data: media, url: msg.message.imageMessage.url, metadata });
+                                    imageQueue.set(sender, queue);
+                                    await sendMessageWithRetry(client, sender, { text: `Found: ${metadata.title} by ${metadata.authors[0]}\nSend cover image next.` });
+                                } else {
+                                    await sendMessageWithRetry(client, sender, { text: 'Could not find book details. Please try again with a clearer ISBN image.' });
+                                }
+                            } else {
+                                console.log('Image is not an ISBN, ignoring...');
+                                await sendMessageWithRetry(client, sender, { text: 'Could not find a valid ISBN in the image. Please try again with a clearer image of the ISBN.' });
+                            }
+                        } else if (queue.length === 1) {
+                            console.log('Processing cover image...');
+                            const isbnData = queue[0];
+                            
+                            try {
+                                console.log(`Processing book: ${isbnData.metadata.title}, ISBN: ${isbnData.metadata.isbn}`);
+                                console.log(`Original cover URL: ${msg.message.imageMessage.url}`);
+                                
+                                // Save image to Drive
+                                const driveUrl = await saveImageToDrive(
+                                    msg.message.imageMessage.url,
+                                    isbnData.metadata.title || 'Unknown',
+                                    isbnData.metadata.isbn || 'NoISBN',
+                                    drive,
+                                    client,
+                                    msg
+                                );
+                                
+                                // If we couldn't save to Drive, use WhatsApp URL but with a warning
+                                const finalCoverUrl = driveUrl || msg.message.imageMessage.url;
+                                const driveWarning = !driveUrl ? " (WARNING: Could not save to Google Drive, using WhatsApp URL instead)" : "";
+                                
+                                console.log(`Using cover URL: ${finalCoverUrl}${driveWarning}`);
+                                
+                                // Create metadata object with the URL
+                                const baseMetadata = {
+                                    ...isbnData.metadata,
+                                    googleDriveUrl: driveUrl || msg.message.imageMessage.url
+                                };
+                                
+                                // Fetch additional metadata
+                                const metadata = await fetchMetadata(isbnData.metadata.isbn, baseMetadata);
+                                console.log(`Using URL for metadata: ${metadata.googleDriveUrl}`);
+                                
+                                // Create the book data object
+                                const bookData = {
+                                    isbn: isbnData.metadata.isbn,
+                                    title: metadata?.title || isbnData.metadata.title || 'Unknown',
+                                    author: metadata?.authors?.[0] || isbnData.metadata.author || 'Unknown Author',
+                                    cover: finalCoverUrl,
+                                    condition: '',
+                                    sheetId: isbnData.sheetId,
+                                    metadata: metadata
+                                };
+                                
+                                // Add to user's books
+                                userBooks.push(bookData);
+                                userDatabases.set(sender, userBooks);
+                                saveUserBooks();
+                                
+                                // Send confirmation message
+                                await sendMessageWithRetry(client, sender, { 
+                                    text: `Added: ${bookData.title}${driveWarning}`
+                                });
+                                
+                                // Clear the queue after processing
+                                imageQueue.set(sender, []);
+                            } catch (error) {
+                                console.error('Error processing cover image:', error);
+                                await sendMessageWithRetry(client, sender, { 
+                                    text: `Error processing book: ${error.message}. Try again.`
+                                });
                             }
                         }
-                        continue;
+                    } catch (error) {
+                        console.error('Error processing image:', error);
+                        if (queue.length === 0) {
+                            await sendMessageWithRetry(client, sender, { text: 'Error processing ISBN image. Please try again.' });
+                        }
                     }
-                } catch (error) {
-                    console.error('Error processing message:', error);
-                    await client.sendMessage(msg.key.remoteJid, { text: 'Sorry, there was an error processing your message. Please try again.' });
+                    continue;
                 }
+            } catch (error) {
+                console.error('Error processing message:', error);
+                await client.sendMessage(msg.key.remoteJid, { text: 'Sorry, there was an error processing your message. Please try again.' });
             }
-        });
-    } catch (error) {
-        console.error('Error in connectToWhatsApp:', error);
-        if (!isShuttingDown) setTimeout(connectToWhatsApp, 10000);
-    }
+        }
+    });
+  } catch (error) {
+    console.error('WhatsApp error:', error);
+    if (!isShuttingDown) setTimeout(connectToWhatsApp, 10000);
+  }
 }
 
 async function processBatch(userId, queue, userBooks, client, sheets, drive) {

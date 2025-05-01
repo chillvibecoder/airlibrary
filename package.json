@@ -5,6 +5,7 @@
   "main": "index.js",
   "type": "commonjs",
   "dependencies": {
+    "@google-cloud/firestore": "^7.1.0",
     "@google-cloud/vision": "^4.2.1",
     "@google/generative-ai": "^0.24.0",
     "@whiskeysockets/baileys": "^6.17.16",
