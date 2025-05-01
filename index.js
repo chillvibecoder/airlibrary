@@ -320,8 +320,19 @@ async function connectToWhatsApp() {
             }
         }
 
-        // Use the authState directly in your WhatsApp connection
-        const { state, saveCreds } = await useMultiFileAuthState(authState);
+        // Create a custom auth state handler that works in memory
+        const state = {
+            creds: authState.creds || {},
+            keys: authState.keys || {}
+        };
+
+        const saveCreds = async () => {
+            // In production, you would want to store this in a database
+            // For now, we'll just log it
+            console.log('New auth state:', state);
+            return state;
+        };
+
         console.log('Auth state loaded');
 
         const sock = makeWASocket({
@@ -342,8 +353,6 @@ async function connectToWhatsApp() {
         // Handle auth updates
         sock.ev.on('creds.update', async () => {
             const newState = await saveCreds();
-            // In production, you might want to store this in a database
-            // For now, we'll just log it
             console.log('New auth state:', newState);
         });
 
