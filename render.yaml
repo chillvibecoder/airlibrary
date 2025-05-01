@@ -17,9 +17,9 @@ services:
         sync: false
       - key: DRIVE_FOLDER_ID
         sync: false
-      - key: WHATSAPP_AUTH_STATE
-        sync: false
       - key: NODE_OPTIONS
         value: "--openssl-legacy-provider"
+      - key: DEPLOYMENT_TIMESTAMP
+        value: "20250501-1452"
     healthCheckPath: /health
     autoDeploy: true 
